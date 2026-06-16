@@ -26,9 +26,9 @@ class UDPClient:
         self.vehicle_name = vehicle_name
 
         self.logger = logging.getLogger(__name__)
-        self.logger.setLevel(logging.DEBUG)
+        self.logger.setLevel(logging.WARNING)
         console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.DEBUG)  # 设置日志级别为 DEBUG
+        console_handler.setLevel(logging.WARNING)
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         console_handler.setFormatter(formatter)
         self.logger.addHandler(console_handler)  # 添加控制台日志处理
@@ -65,7 +65,6 @@ class UDPClient:
 
     def send(self, message):
         self.sock.sendto(message.encode(), (self.ip, self.send_port))
-        self.logger.info("send message: " + message)
 
     def get_vehicle_state(self):
         return self.vehicle_data
