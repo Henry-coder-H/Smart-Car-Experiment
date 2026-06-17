@@ -33,6 +33,17 @@ class Control:
         self.m_yaw = 0
         self.vehpos_initial_index = 0
         self.route_file = 'exp_routes/birth13_to_big_2000.json'
+        self.route_candidates = {}
+        self.current_route_name = self.route_file
+        self.primary_route_name = self.route_file
+        self.last_route_eval_time = 0.0
+        self.route_eval_interval = 2.0
+        self.route_switch_cooldown_until = 0.0
+        self.route_switch_cooldown = 10.0
+        self.route_switch_margin = 80.0
+        self.route_switch_max_distance = 3.5
+        self.route_switch_max_heading_error = math.radians(25.0)
+        self.current_route_score = float("inf")
         self.num_preview = 14
         self.targetPos_Info = [0.0, 0.0]
         self.Y_points = []
@@ -53,12 +64,13 @@ class Control:
         self.max_competition_speed = 18.5
         self.safety_stop_distance = 5.0
         self.follow_time_gap = 1.2
+        self.init_route_candidates()
 
     def control_node(self):
         start_time = time.time()
         self.run_start_time = start_time
         self.init_run_log()
-        self.load_route(self.route_file)
+        self.load_route(self.current_route_name)
         while True:
             vehicle_data = self.udp_client.get_vehicle_state()
             if vehicle_data.name == "":
@@ -81,6 +93,8 @@ class Control:
                 )
                 self.start_pose_printed = True
             self.update_vehpos_index()
+            self.maybe_select_best_route()
+            self.update_vehpos_index()
             self.search_target_pos()
 
             v, w = self.calc_pure_pursuit(self.m_x, self.m_y, self.m_yaw, self.targetPos_Info)
@@ -100,7 +114,7 @@ class Control:
         log_path = os.path.join("logs", file_name)
         self.log_file = open(log_path, "w", encoding="utf-8", buffering=1)
         self.log_file.write(
-            "time,x,y,yaw_deg,speed,accel,cmd_v,cmd_w,route_index,target_x,target_y\n"
+            "time,x,y,yaw_deg,speed,accel,cmd_v,cmd_w,route_index,target_x,target_y,current_route,route_score\n"
         )
         print("RUN_LOG", log_path)
 
@@ -119,7 +133,7 @@ class Control:
         self.prev_log_speed = vehicle_data.speed
         elapsed = now - self.run_start_time if self.run_start_time is not None else 0.0
         self.log_file.write(
-            "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.6f,%d,%.3f,%.3f\n" % (
+            "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.6f,%d,%.3f,%.3f,%s,%.3f\n" % (
                 elapsed,
                 self.m_x,
                 self.m_y,
@@ -131,30 +145,78 @@ class Control:
                 self.vehpos_initial_index,
                 self.targetPos_Info[0],
                 self.targetPos_Info[1],
+                self.current_route_name,
+                self.current_route_score,
             )
         )
 
     def load_route(self, file_path):
+        self.X_points, self.Y_points = self.load_route_points(file_path)
+
+    def load_route_points(self, file_path):
         with open(file_path, 'r', encoding='utf-8') as file:
             json_track = json.load(file)
 
         if isinstance(json_track, list):
-            self.X_points = [point["x"] for point in json_track]
-            self.Y_points = [point["y"] for point in json_track]
+            x_points = [point["x"] for point in json_track]
+            y_points = [point["y"] for point in json_track]
         elif isinstance(json_track, dict) and "X" in json_track and "Y" in json_track:
-            self.X_points = json_track["X"]
-            self.Y_points = json_track["Y"]
+            x_points = json_track["X"]
+            y_points = json_track["Y"]
         else:
             raise ValueError(
                 "Unsupported route format. Expected [{'x': ..., 'y': ...}, ...] "
                 "or {'X': [...], 'Y': [...]}."
             )
 
-        if len(self.X_points) != len(self.Y_points) or len(self.X_points) == 0:
+        if len(x_points) != len(y_points) or len(x_points) == 0:
             raise ValueError("Route file must contain the same non-zero number of X and Y points.")
 
-        self.X_points = [float(x) for x in self.X_points]
-        self.Y_points = [float(y) for y in self.Y_points]
+        return [float(x) for x in x_points], [float(y) for y in y_points]
+
+    def init_route_candidates(self):
+        preferred_routes = [
+            "exp_routes/birth13_to_big_2000.json",
+            "exp_routes/birth13_mid_fast.json",
+            "exp_routes/birth13_big_loop.json",
+            "exp_routes/Big.json",
+            "exp_routes/midInside.json",
+            "exp_routes/rightInside.json",
+            "exp_routes/leftInside.json",
+        ]
+
+        route_files = []
+        for file_path in preferred_routes:
+            if os.path.exists(file_path) and file_path not in route_files:
+                route_files.append(file_path)
+
+        if len(route_files) < 2 and os.path.isdir("exp_routes"):
+            for file_name in sorted(os.listdir("exp_routes")):
+                if file_name.endswith(".json"):
+                    file_path = os.path.join("exp_routes", file_name).replace("\\", "/")
+                    if file_path not in route_files:
+                        route_files.append(file_path)
+                    if len(route_files) >= 5:
+                        break
+
+        for file_path in route_files:
+            try:
+                x_points, y_points = self.load_route_points(file_path)
+                self.route_candidates[file_path] = (x_points, y_points)
+            except Exception as exc:
+                print("ROUTE_LOAD_FAILED", file_path, exc)
+
+        if self.route_file not in self.route_candidates:
+            try:
+                self.route_candidates[self.route_file] = self.load_route_points(self.route_file)
+            except Exception as exc:
+                print("ROUTE_LOAD_FAILED", self.route_file, exc)
+
+        if self.current_route_name not in self.route_candidates and self.route_candidates:
+            self.current_route_name = next(iter(self.route_candidates))
+            self.route_file = self.current_route_name
+
+        print("ROUTE_CANDIDATES", list(self.route_candidates.keys()))
 
     def normalize_angle(self, angle):
         return (angle + math.pi) % (2.0 * math.pi) - math.pi
@@ -196,6 +258,13 @@ class Control:
             self.X_points[next_index] - self.X_points[index]
         )
 
+    def get_route_heading_for_points(self, route_x, route_y, index):
+        route_size = min(len(route_x), len(route_y))
+        if route_size < 2:
+            return self.m_yaw
+        index = max(0, min(int(index), route_size - 2))
+        return math.atan2(route_y[index + 1] - route_y[index], route_x[index + 1] - route_x[index])
+
     def get_signed_lateral_error(self, m_x, m_y, index):
         if len(self.X_points) < 2:
             return 0.0
@@ -206,42 +275,243 @@ class Control:
         return -math.sin(path_heading) * dx + math.cos(path_heading) * dy
 
     def project_to_route(self, m_x, m_y):
-        route_size = len(self.X_points)
-        if route_size < 2:
+        if len(self.X_points) < 2:
             return self.vehpos_initial_index, m_x, m_y, self.m_yaw, 0.0
 
-        best_distance = float('inf')
-        best_result = (self.vehpos_initial_index, self.X_points[0], self.Y_points[0], self.m_yaw, 0.0)
-        for offset in range(0, 70):
-            index = (self.vehpos_initial_index + offset) % route_size
-            next_index = (index + 1) % route_size
-            x0 = self.X_points[index]
-            y0 = self.Y_points[index]
-            x1 = self.X_points[next_index]
-            y1 = self.Y_points[next_index]
+        index, proj_x, proj_y, _, lateral_error, _ = self.project_point_to_route(
+            m_x,
+            m_y,
+            self.X_points,
+            self.Y_points,
+            self.vehpos_initial_index,
+            70,
+        )
+        return index, proj_x, proj_y, self.get_path_heading(index), lateral_error
+
+    def project_point_to_route(self, px, py, route_x, route_y, start_index=0, search_count=None):
+        """将任意点投影到指定路线，返回最近路径段、投影点和沿路径距离。"""
+        route_size = min(len(route_x), len(route_y))
+        if route_size < 2:
+            return 0, px, py, 0.0, 0.0, float("inf")
+
+        segment_count = route_size - 1
+        start_index = max(0, min(int(start_index), segment_count - 1))
+        if search_count is None:
+            search_count = segment_count
+        search_count = max(1, min(int(search_count), segment_count))
+
+        best_distance = float("inf")
+        best_result = (start_index, route_x[start_index], route_y[start_index], 0.0, 0.0, float("inf"))
+        accumulated_s = 0.0
+
+        for offset in range(search_count):
+            index = (start_index + offset) % segment_count
+            next_index = index + 1
+            x0 = route_x[index]
+            y0 = route_y[index]
+            x1 = route_x[next_index]
+            y1 = route_y[next_index]
             sx = x1 - x0
             sy = y1 - y0
             segment_length_sq = sx * sx + sy * sy
             if segment_length_sq < 1e-9:
                 continue
 
-            t = ((m_x - x0) * sx + (m_y - y0) * sy) / segment_length_sq
+            t = ((px - x0) * sx + (py - y0) * sy) / segment_length_sq
             t = max(0.0, min(1.0, t))
             proj_x = x0 + t * sx
             proj_y = y0 + t * sy
-            dx = m_x - proj_x
-            dy = m_y - proj_y
+            dx = px - proj_x
+            dy = py - proj_y
             distance = math.hypot(dx, dy)
+            segment_length = math.sqrt(segment_length_sq)
             if distance < best_distance:
-                heading = math.atan2(sy, sx)
-                segment_length = math.sqrt(segment_length_sq)
                 ux = sx / segment_length
                 uy = sy / segment_length
                 signed_error = ux * dy - uy * dx
                 best_distance = distance
-                best_result = (index, proj_x, proj_y, heading, signed_error)
+                best_result = (index, proj_x, proj_y, accumulated_s + t * segment_length, signed_error, distance)
+
+            accumulated_s += segment_length
 
         return best_result
+
+    def get_route_turn_ratio_for_points(self, route_x, route_y, start_index, preview_count=18):
+        """计算任意候选路线前方曲率强度。"""
+        route_size = min(len(route_x), len(route_y))
+        if route_size < 4:
+            return 0.0
+
+        segment_count = route_size - 1
+        start_index = max(0, min(int(start_index), segment_count - 1))
+        heading_changes = []
+        for offset in range(min(preview_count, segment_count - 2)):
+            i0 = (start_index + offset) % segment_count
+            i1 = (i0 + 1) % segment_count
+            i2 = (i0 + 2) % segment_count
+            dx1 = route_x[i1] - route_x[i0]
+            dy1 = route_y[i1] - route_y[i0]
+            dx2 = route_x[i2] - route_x[i1]
+            dy2 = route_y[i2] - route_y[i1]
+            if math.hypot(dx1, dy1) < 1e-6 or math.hypot(dx2, dy2) < 1e-6:
+                continue
+
+            h1 = math.atan2(dy1, dx1)
+            h2 = math.atan2(dy2, dx2)
+            heading_changes.append(abs(self.normalize_angle(h2 - h1)))
+
+        if not heading_changes:
+            return 0.0
+        return min(max(heading_changes) / math.radians(8.0), 1.0)
+
+    def estimate_route_curvature_score(self, route_x, route_y, start_index):
+        """估计候选路线前方弯道复杂度。"""
+        score = 0.0
+        for preview_count in (12, 24, 48):
+            score += self.get_route_turn_ratio_for_points(route_x, route_y, start_index, preview_count) * preview_count
+        return score
+
+    def score_route(self, route_name, route_x, route_y, other_vehicles):
+        """综合拥堵、慢车、曲率和切换成本为候选路线打分。"""
+        if len(route_x) < 2 or len(route_y) < 2:
+            return float("inf")
+
+        if route_name != self.current_route_name and not self.is_route_switch_feasible(route_name, route_x, route_y):
+            return float("inf")
+
+        my_index, _, _, my_s, _, _ = self.project_point_to_route(self.m_x, self.m_y, route_x, route_y)
+        route_length = sum(
+            math.hypot(route_x[i + 1] - route_x[i], route_y[i + 1] - route_y[i])
+            for i in range(len(route_x) - 1)
+        )
+        score = 0.0
+
+        for other_vehicle in other_vehicles:
+            for predict_t in (0.0, 1.0, 2.0, 3.0):
+                pred_x = other_vehicle.x + other_vehicle.speed * math.cos(other_vehicle.yaw) * predict_t
+                pred_y = other_vehicle.y + other_vehicle.speed * math.sin(other_vehicle.yaw) * predict_t
+                _, _, _, car_s, lateral_error, distance = self.project_point_to_route(
+                    pred_x,
+                    pred_y,
+                    route_x,
+                    route_y,
+                    my_index,
+                    min(500, max(1, len(route_x) - 1)),
+                )
+                gap = car_s - my_s
+                if gap < 0.0 and route_length > 0.0:
+                    gap += route_length
+                if not (0.0 < gap < 120.0):
+                    continue
+                if abs(lateral_error) >= 4.0 and distance >= 4.0:
+                    continue
+
+                weight = 1.0 / (1.0 + predict_t)
+                distance_penalty = 100.0 / max(gap, 5.0)
+                slow_penalty = max(0.0, 12.0 - other_vehicle.speed) * 2.0
+                close_penalty = max(0.0, 4.0 - min(abs(lateral_error), distance)) * 5.0
+                score += weight * (distance_penalty + slow_penalty + close_penalty)
+
+        score += 0.8 * self.estimate_route_curvature_score(route_x, route_y, my_index)
+        if route_name != self.current_route_name:
+            _, _, _, _, _, switch_distance = self.project_point_to_route(self.m_x, self.m_y, route_x, route_y)
+            score += 35.0 + min(switch_distance, 20.0) * 4.0
+        if route_name != self.primary_route_name:
+            score += 20.0
+        return score
+
+    def is_route_switch_feasible(self, route_name, route_x, route_y):
+        """检查新路线是否能从当前位置和车头方向平滑接入。"""
+        if len(route_x) < 2 or len(route_y) < 2:
+            return False
+
+        index, _, _, _, _, distance = self.project_point_to_route(self.m_x, self.m_y, route_x, route_y)
+        route_heading = self.get_route_heading_for_points(route_x, route_y, index)
+        heading_error = abs(self.normalize_angle(route_heading - self.m_yaw))
+        feasible = (
+            distance <= self.route_switch_max_distance
+            and heading_error <= self.route_switch_max_heading_error
+        )
+        if not feasible:
+            print(
+                "ROUTE_SWITCH_REJECT",
+                route_name,
+                "distance=%.2f" % distance,
+                "heading_error_deg=%.1f" % math.degrees(heading_error),
+            )
+        return feasible
+
+    def switch_route(self, route_name):
+        """切换当前路线，并在新路线中重定位最近点。"""
+        if route_name not in self.route_candidates:
+            return False
+
+        route_x, route_y = self.route_candidates[route_name]
+        if len(route_x) < 2 or len(route_y) < 2:
+            return False
+        if route_name != self.current_route_name and not self.is_route_switch_feasible(route_name, route_x, route_y):
+            return False
+
+        old_route = self.current_route_name
+        self.X_points = list(route_x)
+        self.Y_points = list(route_y)
+        self.current_route_name = route_name
+        self.route_file = route_name
+        self.search_vehicle_initial_index()
+        self.targetPos_Info = [self.X_points[self.vehpos_initial_index], self.Y_points[self.vehpos_initial_index]]
+        self.prev_lateral_error = 0.0
+        print("ROUTE_SWITCH", old_route, "->", route_name)
+        return True
+
+    def should_yield_to_vehicle(self, relative_angle, distance):
+        """基于相对位置和距离让行，避免简单按车辆名决定优先级。"""
+        other_on_right = relative_angle < 0.0
+        very_close = distance < 8.0
+        return other_on_right or very_close
+
+    def maybe_select_best_route(self):
+        now = time.time()
+        if now - self.last_route_eval_time < self.route_eval_interval:
+            return
+        self.last_route_eval_time = now
+        self.select_best_route()
+
+    def select_best_route(self):
+        """低频评估全局多车状态，选择更空、更顺的安全路线。"""
+        if len(self.route_candidates) < 2:
+            return
+
+        other_vehicles = self.udp_client.get_neighbor_vehicle_state()
+        if not other_vehicles:
+            route_points = self.route_candidates.get(self.current_route_name)
+            if route_points is not None:
+                self.current_route_score = self.score_route(self.current_route_name, route_points[0], route_points[1], [])
+            print("BEST_ROUTE", self.current_route_name, "%.2f" % self.current_route_score, "CURRENT", self.current_route_name, "%.2f" % self.current_route_score)
+            return
+
+        scores = {}
+        best_route = self.current_route_name
+        best_score = float("inf")
+        for route_name, (route_x, route_y) in self.route_candidates.items():
+            score = self.score_route(route_name, route_x, route_y, other_vehicles)
+            scores[route_name] = score
+            print("ROUTE_SCORE", route_name, "%.2f" % score)
+            if score < best_score:
+                best_route = route_name
+                best_score = score
+
+        current_score = scores.get(self.current_route_name, float("inf"))
+        self.current_route_score = current_score
+        print("BEST_ROUTE", best_route, "%.2f" % best_score, "CURRENT", self.current_route_name, "%.2f" % current_score)
+
+        if (
+            best_route != self.current_route_name
+            and best_score + self.route_switch_margin < current_score
+            and time.time() > self.route_switch_cooldown_until
+        ):
+            if self.switch_route(best_route):
+                self.current_route_score = best_score
+                self.route_switch_cooldown_until = time.time() + self.route_switch_cooldown
 
     def get_priority_value(self, name):
         text = str(name)
@@ -257,7 +527,6 @@ class Control:
             self.blocked_since = None
             return min(v, self.max_competition_speed), w
 
-        my_priority = self.get_priority_value(self.vehicle_name)
         speed_limit = self.max_competition_speed
         command_speed = min(v, speed_limit)
         command_w = w
@@ -307,7 +576,7 @@ class Control:
                 and abs(relative_angle) <= math.radians(100.0)
                 and abs(self.normalize_angle(other_vehicle.yaw - m_yaw)) > math.radians(35.0)
             )
-            if is_cross_conflict and my_priority > self.get_priority_value(other_vehicle.name):
+            if is_cross_conflict and self.should_yield_to_vehicle(relative_angle, distance):
                 should_yield = True
                 command_speed = min(command_speed, 3.0)
 
@@ -317,7 +586,7 @@ class Control:
                 and abs(relative_angle) <= math.radians(30.0)
                 and abs(self.normalize_angle(other_vehicle.yaw - m_yaw)) > math.radians(135.0)
             )
-            if is_head_on and my_priority > self.get_priority_value(other_vehicle.name):
+            if is_head_on and self.should_yield_to_vehicle(relative_angle, distance):
                 should_yield = True
                 command_speed = min(command_speed, 2.0)
 
