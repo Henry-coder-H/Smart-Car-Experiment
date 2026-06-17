@@ -13,7 +13,7 @@ class Control:
         self.udp_send_port = 9001 
         self.server_ip = '192.168.1.100'
 
-        net = "eJ5ZiZpxr8LN0D0X0col3vA8AElc,192.168.28.1,7986,7987"
+        net = "eJ5ZiZpxr8LN0D0X0col3vA8AElc,192.168.28.1,5422,5423"
         if net != "":
             net = net.split(",")
             self.vehicle_name = net[0]
@@ -32,7 +32,7 @@ class Control:
         self.m_y = 0
         self.m_yaw = 0
         self.vehpos_initial_index = 0
-        self.route_file = 'exp_routes/birth13_to_big_2000.json'
+        self.route_file = 'exp_routes/birth13_right_big_5000.json'
         self.route_candidates = {}
         self.current_route_name = self.route_file
         self.primary_route_name = self.route_file
@@ -61,9 +61,10 @@ class Control:
         self.overtake_until = 0.0
         self.overtake_offset = 0.0
         self.start_pose_printed = False
-        self.max_competition_speed = 18.5
+        self.max_competition_speed = 20.0
         self.safety_stop_distance = 5.0
         self.follow_time_gap = 1.2
+        self.launch_route_index = 35
         self.init_route_candidates()
 
     def control_node(self):
@@ -176,13 +177,10 @@ class Control:
 
     def init_route_candidates(self):
         preferred_routes = [
-            "exp_routes/birth13_to_big_2000.json",
-            "exp_routes/birth13_mid_fast.json",
-            "exp_routes/birth13_big_loop.json",
-            "exp_routes/Big.json",
-            "exp_routes/midInside.json",
-            "exp_routes/rightInside.json",
-            "exp_routes/leftInside.json",
+            "exp_routes/birth13_right_big_5000.json",
+            "exp_routes/birth13_mid_right.json",
+            "exp_routes/birth13_big_loop_right.json",
+            "exp_routes/Big_right.json",
         ]
 
         route_files = []
@@ -469,6 +467,37 @@ class Control:
         very_close = distance < 8.0
         return other_on_right or very_close
 
+    def has_vehicle_ahead_on_current_route(self, lookahead_distance=90.0):
+        """判断当前路线前方短距离内是否有占道车辆。"""
+        if len(self.X_points) < 2:
+            return False
+
+        other_vehicles = self.udp_client.get_neighbor_vehicle_state()
+        if not other_vehicles:
+            return False
+
+        my_index, _, _, my_s, _, _ = self.project_point_to_route(
+            self.m_x,
+            self.m_y,
+            self.X_points,
+            self.Y_points,
+            self.vehpos_initial_index,
+            80,
+        )
+        for other_vehicle in other_vehicles:
+            _, _, _, car_s, lateral_error, distance = self.project_point_to_route(
+                other_vehicle.x,
+                other_vehicle.y,
+                self.X_points,
+                self.Y_points,
+                my_index,
+                min(300, max(1, len(self.X_points) - 1)),
+            )
+            gap = car_s - my_s
+            if 0.0 < gap < lookahead_distance and min(abs(lateral_error), distance) < 4.0:
+                return True
+        return False
+
     def maybe_select_best_route(self):
         now = time.time()
         if now - self.last_route_eval_time < self.route_eval_interval:
@@ -546,6 +575,15 @@ class Control:
             relative_angle = self.normalize_angle(target_yaw - m_yaw)
             front_distance = max(8.0, self.safety_stop_distance + command_speed * self.follow_time_gap)
             route_turn = self.get_route_turn_ratio(self.vehpos_initial_index, preview_count=8)
+            is_head_on = (
+                distance <= 16.0
+                and abs(relative_angle) <= math.radians(35.0)
+                and abs(self.normalize_angle(other_vehicle.yaw - m_yaw)) > math.radians(135.0)
+            )
+
+            # 我方路线按右侧行驶设计；遇到真正对向来车时不主动减速/让行，避免被迫驶离右侧道路。
+            if is_head_on and self.current_route_name == self.primary_route_name:
+                continue
 
             # 极近距离不区分方向，先保命避免碰撞违规。
             if distance <= 3.5:
@@ -581,11 +619,6 @@ class Control:
                 command_speed = min(command_speed, 3.0)
 
             # 对向会车或狭窄道路死锁：低优先级车让行，但避免超过 10 秒完全停车。
-            is_head_on = (
-                distance <= 14.0
-                and abs(relative_angle) <= math.radians(30.0)
-                and abs(self.normalize_angle(other_vehicle.yaw - m_yaw)) > math.radians(135.0)
-            )
             if is_head_on and self.should_yield_to_vehicle(relative_angle, distance):
                 should_yield = True
                 command_speed = min(command_speed, 2.0)
@@ -614,7 +647,7 @@ class Control:
         route_index, _, _, path_heading, lateral_error = self.project_to_route(m_x, m_y)
         self.vehpos_initial_index = route_index
         route_turn = self.get_route_turn_ratio(route_index, preview_count=8)
-        speed_turn = self.get_route_turn_ratio(route_index, preview_count=26)
+        speed_turn = self.get_route_turn_ratio(route_index, preview_count=10)
         heading_error = self.normalize_angle(path_heading - m_yaw)
         speed_for_control = max(abs(self.m_v), 5.0)
         dt = 1.0 / self.control_rate
@@ -649,18 +682,26 @@ class Control:
         steer_ratio = min(abs(steering_angle) / max_steer, 1.0)
         error_ratio = min(abs(lateral_error_to_target) / 2.8, 1.0)
         heading_ratio = min(abs(heading_error) / math.radians(35.0), 1.0)
-        turn_ratio = max(0.75 * steer_ratio, speed_turn, 0.9 * error_ratio, 0.7 * heading_ratio)
+        vehicle_ahead = self.has_vehicle_ahead_on_current_route()
+        speed_turn_for_speed = speed_turn if vehicle_ahead else 0.55 * speed_turn
+        turn_ratio = max(0.75 * steer_ratio, speed_turn_for_speed, 0.9 * error_ratio, 0.7 * heading_ratio)
 
         max_speed = self.max_competition_speed
         min_speed = 4.5
         desired_speed = max_speed - (max_speed - min_speed) * (turn_ratio ** 1.05)
 
         if route_index < 8:
-            desired_speed = min(desired_speed, 5.0)
+            desired_speed = min(desired_speed, 8.0)
+        if route_index < self.launch_route_index and speed_turn < 0.15:
+            desired_speed = max(desired_speed, 14.0)
         if active_overtake:
             desired_speed = min(desired_speed, 8.0)
+        if speed_turn > 0.45:
+            desired_speed = min(desired_speed, 10.5)
         if abs(lateral_error_to_target) > 1.2:
-            desired_speed = min(desired_speed, 9.0)
+            desired_speed = min(desired_speed, 12.0)
+        if abs(lateral_error_to_target) > 2.0:
+            desired_speed = min(desired_speed, 6.0)
         if abs(heading_error) > math.radians(70.0):
             desired_speed = min(desired_speed, min_speed)
 
@@ -672,7 +713,7 @@ class Control:
         steer_delta = max(min(steer_delta, max_steer_step), -max_steer_step)
         steering_angle = self.prev_steer_cmd + steer_delta
 
-        max_accel = 3.5
+        max_accel = 9.0 if route_index < self.launch_route_index else 7.0
         max_decel = 10.0
         speed_delta = desired_speed - self.prev_speed_cmd
         speed_delta = max(min(speed_delta, max_accel * dt), -max_decel * dt)
@@ -682,7 +723,7 @@ class Control:
         self.prev_speed_cmd = v
 
         w = v * math.tan(steering_angle) / self.wheel_base
-        max_w = 0.12 if is_straight and not active_overtake else 0.28 + 0.85 * route_turn
+        max_w = 0.12 if is_straight and not active_overtake else min(0.68, 0.24 + 0.55 * route_turn)
         w = max(min(w, max_w), -max_w)
         return v, w
 
@@ -746,7 +787,9 @@ class Control:
         # 高速直道看远一点抑制画龙；弯道缩短预瞄，避免提前吸到弯后的路径点。
         route_turn = self.get_route_turn_ratio(self.vehpos_initial_index)
         preview_distance = self.num_preview + 0.15 * self.m_v - 4.0 * route_turn
-        preview_distance = max(6.5, min(18.0, preview_distance))
+        if route_turn > 0.35:
+            preview_distance = min(preview_distance, 6.2)
+        preview_distance = max(5.8, min(18.0, preview_distance))
 
         target_pos_index = self.vehpos_initial_index
         accumulated_distance = 0.0
