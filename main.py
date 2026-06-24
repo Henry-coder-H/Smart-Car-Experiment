@@ -13,7 +13,7 @@ class Control:
         self.udp_send_port = 9001 
         self.server_ip = '192.168.1.100'
 
-        net = "eJ5ZiZpxr8LN0D0X0col3vA8AElc,192.168.28.1,5422,5423"
+        net = "eJ5ZiZpxr8LN0D0X0col3vA8AElc,192.168.28.1,1432,1433"
         if net != "":
             net = net.split(",")
             self.vehicle_name = net[0]
@@ -467,6 +467,12 @@ class Control:
         very_close = distance < 8.0
         return other_on_right or very_close
 
+    def is_vehicle_on_driving_line(self, dx, dy, m_yaw, lookahead_distance, half_width=1.0):
+        """直道避让只关注本车车身前方的窄走廊，旁边/对向其它车道不影响速度。"""
+        longitudinal = math.cos(m_yaw) * dx + math.sin(m_yaw) * dy
+        lateral = -math.sin(m_yaw) * dx + math.cos(m_yaw) * dy
+        return -2.5 <= longitudinal <= lookahead_distance and abs(lateral) <= half_width
+
     def has_vehicle_ahead_on_current_route(self, lookahead_distance=90.0):
         """判断当前路线前方短距离内是否有占道车辆。"""
         if len(self.X_points) < 2:
@@ -562,6 +568,8 @@ class Control:
         should_yield = False
         emergency_stop = False
         nearest_obstacle = float('inf')
+        route_turn = self.get_route_turn_ratio(self.vehpos_initial_index, preview_count=8)
+        is_straight_road = route_turn < 0.08
 
         for other_vehicle in neighbor_vehicle_data:
             dx = other_vehicle.x - m_x
@@ -574,7 +582,12 @@ class Control:
             target_yaw = math.atan2(dy, dx)
             relative_angle = self.normalize_angle(target_yaw - m_yaw)
             front_distance = max(8.0, self.safety_stop_distance + command_speed * self.follow_time_gap)
-            route_turn = self.get_route_turn_ratio(self.vehpos_initial_index, preview_count=8)
+            on_driving_line = self.is_vehicle_on_driving_line(dx, dy, m_yaw, front_distance)
+
+            # 直道策略：只看本车行驶直线上的车辆。旁边车道/对向车道即使角度接近，也不降速。
+            if is_straight_road and not on_driving_line:
+                continue
+
             is_head_on = (
                 distance <= 16.0
                 and abs(relative_angle) <= math.radians(35.0)
@@ -582,7 +595,7 @@ class Control:
             )
 
             # 我方路线按右侧行驶设计；遇到真正对向来车时不主动减速/让行，避免被迫驶离右侧道路。
-            if is_head_on and self.current_route_name == self.primary_route_name:
+            if is_head_on and self.current_route_name == self.primary_route_name and not is_straight_road:
                 continue
 
             # 极近距离不区分方向，先保命避免碰撞违规。
@@ -713,7 +726,7 @@ class Control:
         steer_delta = max(min(steer_delta, max_steer_step), -max_steer_step)
         steering_angle = self.prev_steer_cmd + steer_delta
 
-        max_accel = 9.0 if route_index < self.launch_route_index else 7.0
+        max_accel = 10.0 if route_index < self.launch_route_index else 10.0
         max_decel = 10.0
         speed_delta = desired_speed - self.prev_speed_cmd
         speed_delta = max(min(speed_delta, max_accel * dt), -max_decel * dt)
